@@ -1428,8 +1428,9 @@ static bool ggml_cuda_fattn_tile_q4_0_direct(const ggml_tensor * dst) {
     memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
 
     // Mirrors use_gqa_opt in launch_fattn_tile_switch_ncols2, plus the ncols2 == 6 arm being
-    // reached only after the gqa_ratio % 8 arm above it has failed.
-    if (!mask || max_bias != 0.0f || K->ne[1] % FATTN_KQ_STRIDE != 0) {
+    // reached only after the gqa_ratio % 8 arm above it has failed. The q4_0 loader exists only in
+    // that arm, so a mask the fold cannot share (ne[2] != 1) must keep the f16 staging.
+    if (!mask || mask->ne[2] != 1 || max_bias != 0.0f || K->ne[1] % FATTN_KQ_STRIDE != 0) {
         return false;
     }
     if (K->ne[2] == 0 || Q->ne[2] % K->ne[2] != 0) {
