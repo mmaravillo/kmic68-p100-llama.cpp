@@ -616,9 +616,12 @@ static __global__ void flash_attn_ext_vec(
 // How many Q heads of one GQA group to fold into a single block. 1 disables folding.
 // Only powers of two are instantiated, and the group must divide the head count so that
 // blockIdx.z tiles evenly (launch_fattn computes ntiles_z_gqa = gqa_ratio/ncols2).
-static int ggml_cuda_fattn_vec_gqa_fold(const int gqa_ratio, const int ne02, const float max_bias, const int D) {
+static int ggml_cuda_fattn_vec_gqa_fold(const int gqa_ratio, const int ne02, const ggml_tensor * mask, const float max_bias, const int D) {
     if (max_bias != 0.0f) {
         return 1; // per-head ALiBi slopes cannot share a block
+    }
+    if (mask && mask->ne[2] != 1) {
+        return 1; // per-head mask rows: folded heads would all read head 0's row
     }
 
     // Not restricted to powers of two: the common GQA ratio here is 6, and folding only 4 of it
@@ -678,7 +681,7 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
         float max_bias = 0.0f;
         memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
 
-        const int ncols2 = ggml_cuda_fattn_vec_gqa_fold(gqa_ratio, int(Q->ne[2]), max_bias, D);
+        const int ncols2 = ggml_cuda_fattn_vec_gqa_fold(gqa_ratio, int(Q->ne[2]), dst->src[3], max_bias, D);
 
         if (logit_softcap == 0.0f) {
             constexpr bool use_logit_softcap = false;
@@ -708,7 +711,7 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
         float max_bias = 0.0f;
         memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
 
-        const int ncols2 = ggml_cuda_fattn_vec_gqa_fold(gqa_ratio, int(Q->ne[2]), max_bias, D);
+        const int ncols2 = ggml_cuda_fattn_vec_gqa_fold(gqa_ratio, int(Q->ne[2]), dst->src[3], max_bias, D);
 
         // Scoped to D == 256. With GGML_CUDA_FA_ALL_QUANTS the vec kernel is instantiated for
         // every head size against every K/V type pair, so folding at every D adds 160 MB to
