@@ -5,8 +5,8 @@ which upstream mostly leaves on generic paths. It is tuned for two
 Tesla P100-PCIE-16GB cards, tensor-split, running Qwen3.8-27B Q6_K with a q4_0 KV cache. Other quant
 types (Q5_K_M, Q4_K_M, IQ*, ...) get Pascal paths too.
 
-It tracks upstream by merging. The last merge was upstream `f46bc30cb`
-(2026-09-22), so current model architectures are supported.
+It tracks upstream by merging. The last merge was upstream `41d8297fe`
+(2026-11-19), so current model architectures are supported.
 
 ## Results
 
@@ -34,6 +34,7 @@ Perplexity 2.6101, all-fp32 2.6095; at this size perplexity can't separate them,
 |---|---|
 | [QUICKSTART.md](QUICKSTART.md) | how to run it, and what each flag is for |
 | [CHANGES.md](CHANGES.md) | every code change, grouped by subsystem, with what it measured |
+| [CHANGELOG.md](CHANGELOG.md) | what changed and what it measured, newest first |
 | [FINDINGS.md](FINDINGS.md) | what worked, what failed, what transfers to other Pascal cards, and the measurement traps |
 | [BUILD.md](BUILD.md) | building from source and verifying a build |
 | [THREE-GPU.md](THREE-GPU.md) | measurements on three P100s from a contributor: NCCL, graphs, cancel latency |
