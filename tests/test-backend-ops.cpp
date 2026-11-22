@@ -13555,6 +13555,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 0, 0, 2));
         }
     }
+
+    // q5_1 cache at the same shape: the perf family below enumerates q4_0/q8_0 only, so without
+    // these the direct q5_1 tile loader has no eval coverage. nb >= 3 puts them on the tile path
+    // (vec takes nb <= 2), kv % 256 == 0 satisfies the gate (FATTN_KQ_STRIDE).
+    for (int64_t nb : {3, 4, 5, 6, 32}) {
+        for (int64_t kv : {256, 512, 768, 1024}) {
+            if (kv < nb) {
+                continue;
+            }
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q5_1, GGML_TYPE_Q5_1));
+        }
+    }
+    // per-head mask must decline the direct q5_1 path and keep the f16 staging
+    for (int64_t nb : {3, 32}) {
+        for (int64_t kv : {256, 1024}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q5_1, GGML_TYPE_Q5_1, {0, 1, 2, 3}, true, false, 0, 0, 2));
+        }
+    }
     test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, true, true, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 17, 75, false, false, 0, 1.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
