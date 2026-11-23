@@ -777,11 +777,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
-    // The tile kernel dequantizes a q4_0 or q5_1 cache straight into its shared tile, so it
+    // The tile kernel dequantizes a q4_0, q5_1 or q8_0 cache straight into its shared tile, so it
     // no longer pays launch_fattn's whole-cache f16 conversion. That moved the vec/tile
     // crossover for q4_0: at kv=262144 tile does nb=4 in 4176 us where vec needs 4286 us for nb=2.
-    // q5_1 vec already reads the cache natively, so sending nb<=2 to tile there buys no work and
-    // only changes rounding (fp16 products instead of fp32) - keep vec for q5_1.
+    // q5_1 and q8_0 vec already read the cache natively, so sending nb<=2 to tile there buys no
+    // work and only changes rounding (fp16 products instead of fp32) - keep vec for those.
     const int kv_direct = ggml_cuda_fattn_tile_quant_direct(dst);
 
     // If there are no tensor cores available, use the generic tile kernel:
@@ -877,8 +877,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
-            // The tile kernel dequantizes a q4_0 or q5_1 cache into its shared tile, so those
-            // cases need none of the whole-cache f16 staging -- 512 MiB per GPU at 262144.
+            // The tile kernel dequantizes a q4_0, q5_1 or q8_0 cache into its shared tile, so
+            // those cases need none of the whole-cache f16 staging -- 512 MiB per GPU at 262144.
             need_f16_K = !ggml_cuda_fattn_tile_quant_direct(dst);
             need_f16_V = need_f16_K;
             break;
