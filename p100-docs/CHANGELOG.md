@@ -8,6 +8,60 @@ Measurements are on 2x Tesla P100-PCIE-16GB (`sm_60`, 180 W cap, driver 575.57.0
 what it measured, in time order. Work before 2026-11-19 lives there and in
 [`../OPTLOG.md`](../OPTLOG.md).
 
+## 2026-11-24 - the q4p kernel running on a q5_1 cache
+
+- `f9364850d` teaches `flash_attn_ext_q4p` a q5_1 K and V through the `KQ5` / `VQ51` template flags,
+  takes the block geometry from `fattn_q4p_cfg<R, OLD, KQ8, KQ5>` (KBB 24, NW 12, NSPLIT 4), gates the
+  two cache sides independently, and adds 23 `FLASH_ATTN_EXT` eval cases plus 3 perf shapes, including
+  constant-fill ones. `7e6f4302f` fixes a stale `GGML_CUDA_FA_VEC_MAX_Q` comment. Merged as PR 4
+  (`b451f03c9`).
+
+Before this, a q5_1 cache had no in-register path: `nb <= 2` went to vec, above that to the tile kernel
+that PR 2 made direct. `q4_0` had `q4p`, worth +27% of decode, and it refused q5_1 because the kernel was
+built on the 18 B q4_0 block and required a q4_0 V. Runtime switch `GGML_CUDA_FA_Q4P_Q51`, default on.
+
+Kernel A/B at `kv=262144`, `nh=8`, `us/run`, best of two reps (on against off): nb=1 963 against 2565,
+nb=2 1343 against 7295, nb=3 1811 against 3071, nb=5 3073 against 5185 - 2.66x, 5.45x, 1.70x, 1.69x.
+Against the same q4p shape with q4_0 KV (638 / 943 / 1515 / 1830) the ratio is 1.51 / 1.43 / 1.20 /
+1.68, and the byte ratio is 1.33, so nb 1-3 are near bandwidth-bound and nb=5 is not.
+
+End to end with q5_1 KV, draft cache q4_0, ctx 212992, MTP on, greedy, `LLAMA_SPEC_SAMPLE_TEMP=1.0`
+(so the draft chain is sampled and acceptance is not the greedy default), per-pass latency (`ms/token x
+accepted mean length`, not raw `t/s`): 14499 -3.6%, 65812 -10.8%, 130547 -16.6%, 196605 -18.4%; slope
+33.55 -> 21.58 ms per 100k tokens with intercepts 66.7 against 65.9. Without MTP the single-token pass is
+34.7 against 39.5 ms at ~1.3k depth and 39.0 against 50.8 ms at 99215. A q4_0 cache on q4p measures the
+same 34.7 ms as q5_1 on q4p and q8_0 on vec is equally slow, so that gap is vec's fixed per-call cost
+rather than cache bytes - the vec kernel was never cheap at nb=1 regardless of what it reads.
+
+Correctness: full `FLASH_ATTN_EXT` eval 4601 OK / 0 FAIL / 0 NaN; q5_1 family 375 OK, q4_0 428 OK, both
+mixed sides 3 OK each. NMSE against the CPU reference 1.9-2.4e-6 for q4p-q5_1, against 2.2-3.1e-6 for
+tile-q5_1 and 2.5e-6 for q4_0 q4p, tolerance 5e-4. Greedy logits A/B over a 160-position MTP ladder:
+159/160 identical sampled tokens, mean KL 0.001153, non-flip median 1e-6, and the same arm replayed
+against itself 160/160 at KL 0.000000. Not bit-exact and cannot be: this is a different kernel, so the
+accumulation order differs, and PR 2's own routing note (tile over vec at nb<=2 changed 3% of greedy
+tokens) is the same effect. At nb=1 the move is from vec's fp32 PV accumulation to fp16, which cost
+34/256 flips on a no-MTP probe at pre-flip median KL 5.3e-5 - kept, because under MTP a nb=1 target pass
+needs a zero-length draft chain and production always runs MTP.
+
+Two things the debugging left behind, both worth remembering. The 5th bit of a q5_1 value is indexed by
+the dim index inside the block (dim j is `qh` bit j, dim j+16 is `qh` bit j+16, as
+`ggml_dequantize_row_q5_1` does); a nibble-sequential index looks equivalent and shifts the value by
+exactly `16 * d` on the affected dims, dims `28 mod 32`. And dropping `KQ5` from the cfg alias makes the
+kernel read q4_0-sized blocks: KBB 18, NW 9, split stride 36 B, KPF wrongly enabled, and NaN. V is
+dequantized with an fp32 `fmaf` and one fp16 round rather than in pure fp16, because `x * d + m` cancels
+near zero - `tools/proofs-fattn-q4_0/q51_dequant_proof.cpp` puts that at max relative error 4.88e-4 above
+2^-14 and 4 differing samples in 332M.
+
+Context ceilings are unchanged: q5_1 loads and prefills 235520, loads 237568, and 262144 still refuses by
+the same ~15 MiB per card at `h_nextn_dev_alloc`, which no attention kernel touches. Verified by loading
+both 237568 and 262144 with the switch on, and 262144 with it off, for the identical failure.
+
+Open item: nb=5 sits at 1.68x q4_0 instead of 1.33x. Not register spill - ptxas shows no q5_1
+instantiation spilling ((5,3) 168 registers, (4,6) 255, 0 bytes), and the spilling ones are the
+pre-existing q4_0 instantiations - and not the `ncols2=3` half-group config, since `GGML_CUDA_Q4P_NC2=6`
+measures slower than the default (3528 against 3096 us). The cause is that `KQ5` disables `H16QK` and
+`KPF`, so QK products stay fp32; enabling them for q5_1 moves QK to fp16 and needs its own validation pass.
+
 ## 2026-11-23 - a q8_0 cache read directly in the tile kernel
 
 - `4c17c0ec3` adds `flash_attn_tile_load_tile_q8_0`, returns kind 3 from `ggml_cuda_fattn_tile_quant_direct`
