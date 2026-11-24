@@ -4,8 +4,9 @@
 #include "fattn-common.cuh"
 #include "active-tokens.cuh"
 
-// Flash attention for pre-Volta GPUs over a q4_0 K/V cache at head size 256, for the few-token
-// batches of decode and speculative verify (one to five tokens, one GQA group of six heads).
+// Flash attention for pre-Volta GPUs over a quantized K/V cache at head size 256 (K: q4_0,
+// q8_0 or q5_1; V: q4_0 or q5_1), for the few-token batches of decode and speculative verify
+// (one to five tokens, one GQA group of six heads).
 //
 // The tile and vec kernels are issue-bound here, not memory-bound: at 262144 context they read
 // the 151 MB q4_0 cache at ~125 GB/s, a fifth of what the card sustains, and they spend their
@@ -118,7 +119,7 @@ static __device__ __forceinline__ float fattn_q4p_lo_f(const uint32_t x) {
 // K words in registers. QK in fp32: an fp16 variant (bytes as exact q/16 halves) measured the same, since at depth
 // this kernel's time follows the K/V bytes it loads (q8_0 K: +44% bytes, +43% time at 262144 keys, at ~230 GB/s:
 // load latency per word, not DRAM bandwidth).
-template <int R, bool OLD = false, bool KQ8 = false>
+template <int R, bool OLD = false, bool KQ8 = false, bool KQ5 = false>
 struct fattn_q4p_cfg {
     static constexpr int NT     = 256;                    // threads per block
     static constexpr int RG     = Q4P_KNOB(RG, 1);        // row groups
@@ -133,14 +134,14 @@ struct fattn_q4p_cfg {
 #ifndef Q4P_K8_PT
 #define Q4P_K8_PT 2
 #endif
-    static constexpr int NSPLIT = KQ8 ? Q4P_K8_NSPLIT : Q4P_KNOB(NSPLIT, R <= 18 ? 2 : 4);
+    static constexpr int NSPLIT = (KQ8 || KQ5) ? Q4P_K8_NSPLIT : Q4P_KNOB(NSPLIT, R <= 18 ? 2 : 4);
     // 30 rows (5 tokens over the whole GQA group, GGML_CUDA_Q4P_NC2=6) at PT 2 need 0xc8f0 bytes of static shared
     // memory, over sm_60's 48 KB (ptxas error with CUDA 12.0)
-    static constexpr int PT     = KQ8 ? (R > 24 ? 1 : Q4P_K8_PT) : Q4P_KNOB(PT, R <= 24 ? 2 : 1);
+    static constexpr int PT     = (KQ8 || KQ5) ? (R > 24 ? 1 : Q4P_K8_PT) : Q4P_KNOB(PT, R <= 24 ? 2 : 1);
     static constexpr int NQP    = NT/(NSPLIT*RG);         // position slots per pass
     static constexpr int C      = NQP*PT;                 // KV positions per chunk
     static constexpr int BPS    = 8/NSPLIT;               // K blocks per split
-    static constexpr int KBB    = KQ8 ? 34 : 18;          // bytes per K block
+    static constexpr int KBB    = KQ8 ? 34 : (KQ5 ? 24 : 18); // bytes per K block
     static constexpr int DPS    = FATTN_Q4P_D/NSPLIT;     // dimensions per split
     static constexpr int QREG   = DPS*RQP + 4;            // one (split, group) region of Q_s; +4 spreads banks
     // scale per 32-dim partial sum (fewer multiplies) or per value (fewer registers)
@@ -161,11 +162,11 @@ struct fattn_q4p_cfg {
     static constexpr bool PREFETCH = Q4P_KNOB(PF, (!OLD && R == 15) ? 2 : 1) == 1;
     // QK over the BPS blocks of a split: rolled (1) keeps the kernel inside the instruction cache,
     // unrolled (2) holds the whole split's words in registers
-    static constexpr bool ROLL = !KQ8 && Q4P_KNOB(ROLL, 2) == 1;
+    static constexpr bool ROLL = !KQ8 && !KQ5 && Q4P_KNOB(ROLL, 2) == 1;
     // load the next chunk's K words during this chunk's PV phase (needs NW*PT spare registers;
     // R=24 has none)
-    static constexpr bool KPF  = !ROLL && !KQ8 && Q4P_KNOB(KPF, R == 24 ? 2 : 1) == 1;
-    static constexpr bool H16QK = !KQ8 && Q4P_H16QK == 1 && PT == 2 && BLOCK_T && !ROLL;
+    static constexpr bool KPF  = !ROLL && !KQ8 && !KQ5 && Q4P_KNOB(KPF, R == 24 ? 2 : 1) == 1;
+    static constexpr bool H16QK = !KQ8 && !KQ5 && Q4P_H16QK == 1 && PT == 2 && BLOCK_T && !ROLL;
     // fp16 QK with two rows per Q_s word (HFMA2 takes each half broadcast): one LDS.128 per 8 rows
 #ifndef Q4P_QPK
 #define Q4P_QPK 1
@@ -202,6 +203,14 @@ static __device__ __forceinline__ uint32_t fattn_q4p_ld16(const char * p) {
     return __ldg((const unsigned short *) p);
 }
 
+// q5_1 {x(e0), x(e1)} as two bytes: the 4-bit nibble of byte e0/e1 of the qs word nb, plus the
+// 5th bit (bit e0/e1 of the qh field f); x: 0..31
+static __device__ __forceinline__ uint32_t fattn_q4p_q51_xw(const uint32_t nb, const uint32_t f, const int e0, const int e1) {
+    const uint32_t x0 = (nb >> (8*e0)) & 0xF | ((f >> e0) & 1) << 4;
+    const uint32_t x1 = (nb >> (8*e1)) & 0xF | ((f >> e1) & 1) << 4;
+    return x0 | (x1 << 8);
+}
+
 static __device__ __forceinline__ void fattn_q4p_prefetch_l2(const void * p) {
     asm volatile("prefetch.global.L2 [%0];" :: "l"(p));
 }
@@ -222,8 +231,8 @@ static __device__ __forceinline__ int fattn_q4p_pv_dim(const int dg, const int j
     }
 }
 
-template <int ncols1, int ncols2, bool OLD, bool KQ8 = false>
-__launch_bounds__(256, (fattn_q4p_cfg<ncols1*ncols2, OLD, KQ8>::MINB))
+template <int ncols1, int ncols2, bool OLD, bool KQ8 = false, bool KQ5 = false, bool VQ51 = false>
+__launch_bounds__(256, (fattn_q4p_cfg<ncols1*ncols2, OLD, KQ8, KQ5>::MINB))
 static __global__ void flash_attn_ext_q4p(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -251,7 +260,7 @@ static __global__ void flash_attn_ext_q4p(
 #if defined(FLASH_ATTN_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     constexpr int D = FATTN_Q4P_D;
     constexpr int R = ncols1*ncols2;
-    using cfg = fattn_q4p_cfg<R, OLD, KQ8>;
+    using cfg = fattn_q4p_cfg<R, OLD, KQ8, KQ5>;
     constexpr int KBB = cfg::KBB;
     constexpr int NT = cfg::NT, RG = cfg::RG, RQ = cfg::RQ, RQP = cfg::RQP, C = cfg::C, PT = cfg::PT;
     constexpr int NSPLIT = cfg::NSPLIT, NQP = cfg::NQP, BPS = cfg::BPS, DPS = cfg::DPS, QREG = cfg::QREG;
@@ -560,6 +569,55 @@ static __global__ void flash_attn_ext_q4p(
 #pragma unroll
                     for (int r = 0; r < RQ; ++r) {
                         S[pt][r] = fmaf(d[pt], t[pt][r], S[pt][r]);
+                    }
+                }
+                continue;
+            }
+            if constexpr (KQ5) {
+                // block bl starts at word 6*bl, always word-aligned: {d, m}, qh, four qs words.
+                // Dequant is x*d + m in fp32 (x: 0..31), as the CPU reference computes it; the 5th
+                // bit of dim 32*bl + 4*k + e + 16*hh is qh bit 4*k + e + 16*hh: the 5th-bit index
+                // equals the dim index within the block, as in dequantize_row_q5_1
+                const int wb = 6*bl;
+                float    d[PT], m[PT];
+                uint32_t qh[PT], w[PT][4];
+#pragma unroll
+                for (int pt = 0; pt < PT; ++pt) {
+                    d[pt]  = __half2float(__ushort_as_half((unsigned short) (u[pt][wb] & 0xFFFF)));
+                    m[pt]  = __half2float(__ushort_as_half((unsigned short) (u[pt][wb] >> 16)));
+                    qh[pt] = u[pt][wb + 1];
+#pragma unroll
+                    for (int k = 0; k < 4; ++k) {
+                        w[pt][k] = u[pt][wb + 2 + k];
+                    }
+                }
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+#pragma unroll
+                    for (int hh = 0; hh < 2; ++hh) {
+#pragma unroll
+                        for (int e = 0; e < 4; ++e) {
+                            float y[PT];
+#pragma unroll
+                            for (int pt = 0; pt < PT; ++pt) {
+                                y[pt] = fmaf(d[pt], (float) (((w[pt][k] >> (8*e + 4*hh)) & 0xF) | (((qh[pt] >> (4*k + e + 16*hh)) & 1) << 4)), m[pt]);
+                            }
+                            const float4 * q4 = (const float4 *) (Qt + (32*bl + 4*k + e + 16*hh)*RQP);
+#pragma unroll
+                            for (int rq = 0; rq < RQP/4; ++rq) {
+                                const float4 q = q4[rq];
+                                const float qv[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+                                for (int c = 0; c < 4; ++c) {
+                                    if (4*rq + c < RQ) {
+#pragma unroll
+                                        for (int pt = 0; pt < PT; ++pt) {
+                                            S[pt][4*rq + c] = fmaf(qv[c], y[pt], S[pt][4*rq + c]);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 continue;
@@ -921,9 +979,19 @@ static __global__ void flash_attn_ext_q4p(
         // V words are loaded one position ahead: at one block per SM there are too few warps to
         // hide an L2 round trip behind the FMAs of the others
         const char * vrow0 = Vb + int64_t(k0 + min(pg, p_end - 1))*nb21;
-        uint32_t nd  = fattn_q4p_ld16(vrow0 + 18*pv_b);
-        uint32_t nw0 = __ldg((const uint32_t *) (vrow0 + pv_oa));
-        uint32_t nw1 = __ldg((const uint32_t *) (vrow0 + pv_oa + 4));
+        // q4_0 V: the scale plus the two aligned words straddling the 2-byte-aligned qs word;
+        // q5_1 V: {d, m}, qh and the thread's qs word, all 4-byte aligned
+        uint32_t nd = 0, nw0 = 0, nw1 = 0;
+        uint32_t qd = 0, qhw = 0, qw = 0;
+        if constexpr (VQ51) {
+            qd  = __ldg((const uint32_t *) (vrow0 + 24*pv_b));
+            qhw = __ldg((const uint32_t *) (vrow0 + 24*pv_b + 4));
+            qw  = __ldg((const uint32_t *) (vrow0 + 24*pv_b + 8 + 4*pv_k));
+        } else {
+            nd  = fattn_q4p_ld16(vrow0 + 18*pv_b);
+            nw0 = __ldg((const uint32_t *) (vrow0 + pv_oa));
+            nw1 = __ldg((const uint32_t *) (vrow0 + pv_oa + 4));
+        }
         if constexpr (cfg::H16PV) {
             constexpr int NH = DPT/2;   // half2 accumulators per row
             half2 acc2[RQ][NH];
@@ -957,31 +1025,89 @@ static __global__ void flash_attn_ext_q4p(
             int np = 0;
             // V words two positions ahead: a quarter of the fp32 path's work per position no
             // longer covers an L2 round trip
-            uint32_t nd2, nw02, nw12;
+            uint32_t nd2 = 0, nw02 = 0, nw12 = 0;
+            uint32_t qd2 = 0, qhw2 = 0, qw2 = 0;
             // row offsets within the chunk in 32 bits, advanced by one step and clamped to the last
             // row (the 64-bit row products cost ~20 instructions per position)
-            const char * vcd = Vb + int64_t(k0)*nb21 + 18*pv_b;
-            const char * vcw = Vb + int64_t(k0)*nb21 + pv_oa;
+            const char * vcd = Vb + int64_t(k0)*nb21 + (VQ51 ? 24*pv_b : 18*pv_b);
+            const char * vcw = Vb + int64_t(k0)*nb21 + (VQ51 ? 24*pv_b + 8 + 4*pv_k : pv_oa);
+            const char * vcq = Vb + int64_t(k0)*nb21 + 24*pv_b + 4;
             const int vstep = NPG*nb21, vlast = (p_end - 1)*nb21;
             int vo = min(pg + NPG, p_end - 1)*nb21;
             {
-                nd2  = fattn_q4p_ld16(vcd + vo);
-                nw02 = __ldg((const uint32_t *) (vcw + vo));
-                nw12 = __ldg((const uint32_t *) (vcw + vo + 4));
-            }
-#pragma unroll 2
-            for (int p = pg; p < p_end; p += NPG) {
-                const half2    dv2 = __half2half2(__ushort_as_half((unsigned short) nd));
-                const uint32_t wv  = __byte_perm(nw0, nw1, pv_sel);
-                nd = nd2; nw0 = nw02; nw1 = nw12;
-                {
-                    vo = min(vo + vstep, vlast); // row min(p + 2*NPG, p_end - 1)
+                if constexpr (VQ51) {
+                    qd2  = __ldg((const uint32_t *) (vcd + vo));
+                    qhw2 = __ldg((const uint32_t *) (vcq + vo));
+                    qw2  = __ldg((const uint32_t *) (vcw + vo));
+                } else {
                     nd2  = fattn_q4p_ld16(vcd + vo);
                     nw02 = __ldg((const uint32_t *) (vcw + vo));
                     nw12 = __ldg((const uint32_t *) (vcw + vo + 4));
                 }
+            }
+#pragma unroll 2
+            for (int p = pg; p < p_end; p += NPG) {
+                half2 dv2, m2h;
+                uint32_t wv;
+                uint32_t f_lo = 0, f_hi = 0;
+                float    dv = 0.0f, dm = 0.0f;
+                if constexpr (VQ51) {
+                    dv2 = __half2half2(__ushort_as_half((unsigned short) qd));
+                    m2h = __half2half2(__ushort_as_half((unsigned short) (qd >> 16)));
+                    wv  = qw;
+                    dv  = __half2float(__ushort_as_half((unsigned short) qd));
+                    dm  = __half2float(__ushort_as_half((unsigned short) (qd >> 16)));
+                    f_lo = (qhw >> (4*pv_k)) & 0xF;
+                    f_hi = (qhw >> (16 + 4*pv_k)) & 0xF;
+                    qd = qd2; qhw = qhw2; qw = qw2;
+                } else {
+                    dv2 = __half2half2(__ushort_as_half((unsigned short) nd));
+                    wv  = __byte_perm(nw0, nw1, pv_sel);
+                    nd = nd2; nw0 = nw02; nw1 = nw12;
+                }
+                {
+                    vo = min(vo + vstep, vlast); // row min(p + 2*NPG, p_end - 1)
+                    if constexpr (VQ51) {
+                        qd2  = __ldg((const uint32_t *) (vcd + vo));
+                        qhw2 = __ldg((const uint32_t *) (vcq + vo));
+                        qw2  = __ldg((const uint32_t *) (vcw + vo));
+                    } else {
+                        nd2  = fattn_q4p_ld16(vcd + vo);
+                        nw02 = __ldg((const uint32_t *) (vcw + vo));
+                        nw12 = __ldg((const uint32_t *) (vcw + vo + 4));
+                    }
+                }
                 // DPT 4: this thread's nibble half of the word; DPT 8: low nibbles (dims 0-3), then high
                 half2 y[NH];
+                if constexpr (VQ51) {
+                    // x = nibble + 5th bit (0..31); the value is x*d + m. The 5th-bit field of the
+                    // low nibble lane is qh bits 4*k..4*k+3, of the high lane 16+4*k..16+4*k+3; RS
+                    // moves whole nibble lanes, so the field follows the lane it came from.
+                    // The sum is computed in fp32 (one exact fma) and only then rounded to fp16,
+                    // as the conversion kernels do: doing it all in fp16 would let the product
+                    // rounding show through when x*d and m partially cancel (proof:
+                    // p100-handoff/tools/proofs-fattn-q4_0/q51_dequant_proof.cpp)
+#pragma unroll
+                    for (int h2 = 0; h2 < NH/2; ++h2) {
+                        uint32_t nb, f, xa, xb;
+                        int e0, e1;
+                        if constexpr (cfg::RS) {
+                            nb = (wv >> (h2 ? 4 - rs_sh : rs_sh)) & 0x0F0F0F0Fu;
+                            f  = ((h2 == 0) == (rs_sh == 0)) ? f_lo : f_hi;
+                            e0 = rs_e0; e1 = rs_e1;
+                        } else {
+                            nb = (DPT == 8 ? h2 : (dg & 1)) ? ((wv >> 4) & 0x0F0F0F0Fu) : (wv & 0x0F0F0F0Fu);
+                            f  = (DPT == 8 ? h2 : (dg & 1)) ? f_hi : f_lo;
+                            e0 = 0; e1 = 1;
+                        }
+                        xa = fattn_q4p_q51_xw(nb, f, e0,     e1);
+                        xb = fattn_q4p_q51_xw(nb, f, e0 ^ 2, e1 ^ 2);
+                        y[2*h2 + 0] = __floats2half2_rn(fmaf(dv, (float) (xa & 0x3Fu), dm),
+                                                        fmaf(dv, (float) ((xa >> 8) & 0x3Fu), dm));
+                        y[2*h2 + 1] = __floats2half2_rn(fmaf(dv, (float) (xb & 0x3Fu), dm),
+                                                        fmaf(dv, (float) ((xb >> 8) & 0x3Fu), dm));
+                    }
+                } else {
 #pragma unroll
                 for (int h2 = 0; h2 < NH/2; ++h2) {
                     uint32_t nb, ya, yb;
@@ -998,6 +1124,7 @@ static __global__ void flash_attn_ext_q4p(
                     }
                     y[2*h2 + 0] = __hmul2(__hsub2(*(const half2 *) &ya, off), dv2);
                     y[2*h2 + 1] = __hmul2(__hsub2(*(const half2 *) &yb, off), dv2);
+                }
                 }
                 if constexpr (cfg::PPK) {
                     const uint4 * pq = (const uint4 *) (P_s + p*PSTR);
@@ -1049,17 +1176,55 @@ static __global__ void flash_attn_ext_q4p(
         } else {
 #pragma unroll 2
             for (int p = pg; p < p_end; p += NPG) {
-            const float    dv = __half2float(__ushort_as_half((unsigned short) nd));
-            const uint32_t wv = __byte_perm(nw0, nw1, pv_sel);
+            float dv = 0.0f, dm = 0.0f;
+            uint32_t wv = 0, f_lo = 0, f_hi = 0;
+            if constexpr (VQ51) {
+                dv   = __half2float(__ushort_as_half((unsigned short) qd));
+                dm   = __half2float(__ushort_as_half((unsigned short) (qd >> 16)));
+                wv   = qw;
+                f_lo = (qhw >> (4*pv_k)) & 0xF;
+                f_hi = (qhw >> (16 + 4*pv_k)) & 0xF;
+            } else {
+                dv = __half2float(__ushort_as_half((unsigned short) nd));
+                wv = __byte_perm(nw0, nw1, pv_sel);
+            }
             {
                 const char * vrow = Vb + int64_t(k0 + min(p + NPG, p_end - 1))*nb21;
-                nd  = fattn_q4p_ld16(vrow + 18*pv_b);
-                nw0 = __ldg((const uint32_t *) (vrow + pv_oa));
-                nw1 = __ldg((const uint32_t *) (vrow + pv_oa + 4));
+                if constexpr (VQ51) {
+                    qd  = __ldg((const uint32_t *) (vrow + 24*pv_b));
+                    qhw = __ldg((const uint32_t *) (vrow + 24*pv_b + 4));
+                    qw  = __ldg((const uint32_t *) (vrow + 24*pv_b + 8 + 4*pv_k));
+                } else {
+                    nd  = fattn_q4p_ld16(vrow + 18*pv_b);
+                    nw0 = __ldg((const uint32_t *) (vrow + pv_oa));
+                    nw1 = __ldg((const uint32_t *) (vrow + pv_oa + 4));
+                }
             }
 
             float y[DPT];
-            if constexpr (DPT == 8) {
+            if constexpr (VQ51) {
+                if constexpr (DPT == 8) {
+                    const uint32_t lo = wv & 0x0F0F0F0Fu, hi = (wv >> 4) & 0x0F0F0F0Fu;
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        y[e]     = fmaf(dv, (float) ((lo >> (4*e)) & 0xF | ((f_lo >> e) & 1) << 4), dm);
+                        y[e + 4] = fmaf(dv, (float) ((hi >> (4*e)) & 0xF | ((f_hi >> e) & 1) << 4), dm);
+                    }
+                } else if constexpr (DPT == 4) {
+                    const uint32_t nb = ((dg & 1) ? (wv >> 4) : wv) & 0x0F0F0F0Fu;
+                    const uint32_t f  = (dg & 1) ? f_hi : f_lo;
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        y[e] = fmaf(dv, (float) ((nb >> (4*e)) & 0xF | ((f >> e) & 1) << 4), dm);
+                    }
+                } else {
+                    const uint32_t nb = ((dg & 1) ? (wv >> 4) : wv) & 0x0F0F0F0Fu;
+                    const uint32_t f  = (dg & 1) ? f_hi : f_lo;
+                    const int e0 = 2*((dg >> 1) & 1);
+                    y[0] = fmaf(dv, (float) ((nb >> (8*e0)) & 0xF | ((f >> e0) & 1) << 4), dm);
+                    y[1] = fmaf(dv, (float) ((nb >> (8*e0 + 8)) & 0xF | ((f >> e0 + 1) & 1) << 4), dm);
+                }
+            } else if constexpr (DPT == 8) {
                 const uint32_t lo = wv & 0x0F0F0F0Fu, hi = (wv >> 4) & 0x0F0F0F0Fu;
 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
@@ -1085,7 +1250,16 @@ static __global__ void flash_attn_ext_q4p(
                 const float4 pq = ((const float4 *) (P_s + p*PSTR + vgrp*RQP))[rq];
                 P[4*rq + 0] = pq.x; P[4*rq + 1] = pq.y; P[4*rq + 2] = pq.z; P[4*rq + 3] = pq.w;
             }
-            if constexpr (cfg::FOLD) {
+            if constexpr (VQ51) {
+                // the dequant already carries d and m, so there is no scale to fold
+#pragma unroll
+                for (int r = 0; r < RQ; ++r) {
+#pragma unroll
+                    for (int j = 0; j < DPT; ++j) {
+                        acc[r][j] = fmaf(P[r], y[j], acc[r][j]);
+                    }
+                }
+            } else if constexpr (cfg::FOLD) {
 #pragma unroll
                 for (int r = 0; r < RQ; ++r) {
                     const float pd = P[r]*dv;
@@ -1212,8 +1386,14 @@ static bool ggml_cuda_fattn_q4p_supported(const ggml_tensor * dst) {
     }
     // GGML_CUDA_FA_Q4P_Q8K=0: q8_0 K (with q4_0 V) back to the generic kernels
     static const bool q8k = [] { const char * s = getenv("GGML_CUDA_FA_Q4P_Q8K"); return !s || atoi(s) != 0; }();
-    const bool k_ok = K->type == GGML_TYPE_Q4_0 || (q8k && K->type == GGML_TYPE_Q8_0);
-    if (!k_ok || V->type != GGML_TYPE_Q4_0 || Q->type != GGML_TYPE_F32 || sinks) {
+    // GGML_CUDA_FA_Q4P_Q51=0: q5_1 K/V back to the generic kernels
+    static const bool q51 = [] { const char * s = getenv("GGML_CUDA_FA_Q4P_Q51"); return !s || atoi(s) != 0; }();
+    const bool kq51 = q51 && K->type == GGML_TYPE_Q5_1;
+    const bool vq51 = q51 && V->type == GGML_TYPE_Q5_1;
+    const bool k_ok = K->type == GGML_TYPE_Q4_0 || (q8k && K->type == GGML_TYPE_Q8_0) || kq51;
+    // a q8_0 K with a q5_1 V has no kernel instantiation, so it stays on the generic kernels
+    const bool v_ok = V->type == GGML_TYPE_Q4_0 || (vq51 && K->type != GGML_TYPE_Q8_0);
+    if (!k_ok || !v_ok || Q->type != GGML_TYPE_F32 || sinks) {
         return false;
     }
     if (Q->ne[0] != FATTN_Q4P_D || K->ne[0] != FATTN_Q4P_D || V->ne[0] != FATTN_Q4P_D) {
@@ -1245,6 +1425,24 @@ static bool q4p_old() {
 
 template <int ncols1, int ncols2 = 6>
 static void ggml_cuda_flash_attn_ext_q4p_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const bool k5 = dst->src[1]->type == GGML_TYPE_Q5_1;
+    const bool v5 = dst->src[2]->type == GGML_TYPE_Q5_1;
+    if (k5 && v5) {
+        launch_fattn<FATTN_Q4P_D, ncols1, ncols2>(ctx, dst, flash_attn_ext_q4p<ncols1, ncols2, false, false, true, true>, 256/WARP_SIZE, 0,
+            fattn_q4p_cfg<ncols1*ncols2, false, false, true>::C, false, false, false, false);
+        return;
+    }
+    // the K type alone sets the K geometry (KBB, NSPLIT) in the cfg; VQ51 only changes the PV side
+    if (k5) {
+        launch_fattn<FATTN_Q4P_D, ncols1, ncols2>(ctx, dst, flash_attn_ext_q4p<ncols1, ncols2, false, false, true, false>, 256/WARP_SIZE, 0,
+            fattn_q4p_cfg<ncols1*ncols2, false, false, true>::C, false, false, false, false);
+        return;
+    }
+    if (v5) {
+        launch_fattn<FATTN_Q4P_D, ncols1, ncols2>(ctx, dst, flash_attn_ext_q4p<ncols1, ncols2, false, false, false, true>, 256/WARP_SIZE, 0,
+            fattn_q4p_cfg<ncols1*ncols2, false, false, false>::C, false, false, false, false);
+        return;
+    }
     if (dst->src[1]->type == GGML_TYPE_Q8_0) {
         launch_fattn<FATTN_Q4P_D, ncols1, ncols2>(ctx, dst, flash_attn_ext_q4p<ncols1, ncols2, false, true>, 256/WARP_SIZE, 0,
             fattn_q4p_cfg<ncols1*ncols2, false, true>::C, false, false, false, false);

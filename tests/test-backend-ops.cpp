@@ -9565,6 +9565,42 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     }
 };
 
+// K/V filled with a fixed quant pattern (q4_0: d=1; q5_1: d=1, m=-1.5, qh=0xE7C39A55; both with
+// qs[j] = j | j<<4), so the low 4 bits and the 5th bit of every dim are known. Random data can hide
+// a q5_1 bit-field that is read from the wrong qh position; this fill cannot.
+struct test_flash_attn_ext_qpat : public test_flash_attn_ext {
+    using test_flash_attn_ext::test_flash_attn_ext;
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",qpat=1";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        for (const char * name : {"k", "v"}) {
+            ggml_tensor * t = ggml_get_tensor(ctx, name);
+            GGML_ASSERT(t->type == GGML_TYPE_Q5_1 || t->type == GGML_TYPE_Q4_0);
+            const size_t bs   = ggml_type_size(t->type);
+            const size_t nblk = ggml_nelements(t) / 32;
+            std::vector<uint8_t> buf(bs * nblk);
+            ggml_backend_tensor_get(t, buf.data(), 0, bs * nblk);
+            for (size_t i = 0; i < nblk; ++i) {
+                uint8_t * b = buf.data() + i * bs;
+                if (t->type == GGML_TYPE_Q5_1) {
+                    *(uint16_t *)(b + 0) = ggml_fp32_to_fp16(1.0f);
+                    *(uint16_t *)(b + 2) = ggml_fp32_to_fp16(-1.5f);
+                    b[4] = 0x55; b[5] = 0x9A; b[6] = 0xC3; b[7] = 0xE7;
+                    for (int j = 0; j < 16; ++j) b[8 + j] = (uint8_t)(j | (j << 4));
+                } else {
+                    *(uint16_t *)(b + 0) = ggml_fp32_to_fp16(1.0f);
+                    for (int j = 0; j < 16; ++j) b[2 + j] = (uint8_t)(j | (j << 4));
+                }
+            }
+            ggml_backend_tensor_set(t, buf.data(), 0, bs * nblk);
+        }
+    }
+};
+
 // mask with 2 heads and 2 batches, broadcast over the Q heads and batches
 struct test_flash_attn_ext_mask_bcast : public test_flash_attn_ext {
     using test_flash_attn_ext::test_flash_attn_ext;
@@ -13557,8 +13593,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // q5_1 cache at the same shape: the perf family below enumerates q4_0/q8_0 only, so without
-    // these the direct q5_1 tile loader has no eval coverage. nb >= 3 puts them on the tile path
-    // (vec takes nb <= 2), kv % 256 == 0 satisfies the gate (FATTN_KQ_STRIDE).
+    // these the direct q5_1 tile loader has no eval coverage. With the q4p-q5_1 gate on, nb 3-5
+    // takes the q4p kernel; nb >= 6 keeps the tile path (vec would take nb <= 2), kv % 256 == 0
+    // satisfies the tile gate (FATTN_KQ_STRIDE).
     for (int64_t nb : {3, 4, 5, 6, 32}) {
         for (int64_t kv : {256, 512, 768, 1024}) {
             if (kv < nb) {
@@ -13566,6 +13603,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q5_1, GGML_TYPE_Q5_1));
         }
+    }
+    // The q4p-q5_1 decode/verify widths (nb 1-2; nb 3-5 above now reach q4p too).
+    for (int64_t nb : {1, 2}) {
+        for (int64_t kv : {256, 512, 768, 1024}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q5_1, GGML_TYPE_Q5_1));
+        }
+    }
+    // The same widths at the production cache depth. The 262144 cases in the perf set never
+    // compare against the CPU reference, so a depth-dependent defect (block indexing, tail,
+    // accumulation over 8192 blocks) would be invisible without these.
+    for (int64_t nb : {1, 2, 3, 4, 5}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 262144, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q5_1, GGML_TYPE_Q5_1));
+    }
+    // q5_1 K with q4_0 V and the reverse: the two sides are independent template flags
+    for (int64_t nb : {1, 4, 5}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 256, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q5_1, GGML_TYPE_Q4_0));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 256, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q5_1));
+    }
+    // constant-fill variants: the dequantized value of every dim is known by construction
+    for (int64_t nb : {1, 4}) {
+        test_cases.emplace_back(new test_flash_attn_ext_qpat(256, 256, 2, {6, 1}, 256, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q5_1, GGML_TYPE_Q5_1));
+        test_cases.emplace_back(new test_flash_attn_ext_qpat(256, 256, 2, {6, 1}, 256, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
     }
     // per-head mask must decline the direct q5_1 path and keep the f16 staging
     for (int64_t nb : {3, 32}) {
@@ -14615,7 +14674,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // 16 of the 65 layers carry a growing KV cache (full_attention_interval 4), so a
     // prefill batch costs 16x one of these. Benchmarking the op directly avoids the ~30
     // minutes llama-bench spends rebuilding 262144 tokens of context to time one batch.
-    // nb=2048 is a prefill batch; nb=1 is decode, which takes the VEC kernel instead.
+    // nb=2048 is a prefill batch; nb 1-5 are decode/verify widths, which take the q4p kernel.
     for (int kv : {32768, 65536, 131072, 262144}) {
         for (int nb : {2048, 1024, 512, 16, 8, 7, 6, 5, 4, 3, 2, 1}) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
@@ -14666,6 +14725,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // the key point: ~2x the bytes of q4_0 with the cheapest dequant (no nibble unpack).
     for (ggml_type tkv : {GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 262144, 1, true, false, 0, 0, GGML_PREC_F32, tkv, tkv));
+    }
+    // The q4p kernel's production widths (nb 2-5) with a q5_1 K/V cache, to verify the q4p-q5_1
+    // dispatch end to end (nb=1 above reaches it too; these add the R and DPT shapes it uses).
+    for (int nb : {2, 3, 5}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 262144, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q5_1, GGML_TYPE_Q5_1));
     }
     // Sparse flash attention (n_kv_max hint) decode across KV depths.
     // Shapes: 576/512 DeepSeek MLA, 512/512 DeepSeek-V4/GLM-5.2, 256/256 gqa12 Qwen QSA.

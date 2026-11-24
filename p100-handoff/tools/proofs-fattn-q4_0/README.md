@@ -111,3 +111,36 @@ so any ~790 KB of prose or code does the job:
 Do not reuse that file as a perplexity corpus. PPL numbers are only comparable against the exact
 corpus they were calibrated on, which is `p100-handoff/ppl-orig.txt` and nothing else -- see
 CORPUS.md for how that went wrong once already.
+
+## q5_1 dequant numerics (L1: q4p takes q5_1 K/V)
+
+The q5_1 kernel path dequantizes `x*d + m` (x: 0..31, d, m fp16) two ways:
+- **path A** (K side, V side fp32): `fmaf((float)d, (float)x, (float)m)` - one correctly rounded op.
+- **path B** (V side H16PV, DPT 4/8): `fl16(fmaf((float)d, (float)x, (float)m))` - one exact
+  fp32 fma, then a single RN to fp16, the same scheme as the f16 conversion kernels. An all-fp16
+  scheme `fl16(fl16(x*d) + m)` was rejected after this tool measured it: when x*d and m partially
+  cancel, the product's 2^-11 relative error survives (max rel err 1024 vs the 4.9e-4 bound).
+
+The CPU reference (`dequantize_row_q5_1`) does `fl32((float)x * (float)d) + m`.
+
+`q51_dequant_proof.cpp` (host-only, no GPU) measures A and B against the reference and the exact
+double value over an exhaustive product (all x, all finite d; m grid) plus a 300M random sample:
+
+```
+g++ -O2 -std=c++17 -ffp-contract=off q51_dequant_proof.cpp -o q51_dequant_proof
+./q51_dequant_proof
+```
+
+Expected: A equals the exactly-rounded value always (fma is correctly rounded); A differs from
+the 2-rounding reference only where the reference's own product rounding shows, and the x*d
+product is always exact in fp32 (6 + 11 mantissa bits), so only the final add can differ. B is
+within one fp16 rounding of the fp32 result (max rel ~4.9e-4 vs exact), equals fl16(ref) except
+where the reference's product rounding shifts the value across an fp16 boundary (rare, counted),
+and overflows to inf only for |x*d + m| > 65504 - the same exposure as the f16 cache conversion.
+Recorded run (2026-11-23, 332M samples = exhaustive x*d*m-grid + 300M random triples, P100 host):
+path A 0 mismatches vs exactly-rounded; path B max rel err 4.88e-4 (bound 2^-11) for
+|exact| >= 2^-14, max abs err 2.24e-8 (bound 2^-25) below, B != fl16(ref) 4 of 332M,
+edges d=0/x=0 exact. The 11% "ref finite but B inf" count is the full-range random d/m domain
+reaching |x*d + m| > 65504; real KV values are O(1), so it does not occur.
+The 5th-bit/nibble mapping (which byte and bit feeds which dim) is checked end to end by
+`tests/test-backend-ops` q5_1 cases at nb 1/2/3/5 (262144) against the CPU reference.
