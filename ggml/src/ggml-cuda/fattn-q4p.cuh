@@ -5,8 +5,8 @@
 #include "active-tokens.cuh"
 
 // Flash attention for pre-Volta GPUs over a quantized K/V cache at head size 256 (K: q4_0,
-// q8_0 or q5_1; V: q4_0 or q5_1), for the few-token batches of decode and speculative verify
-// (one to five tokens, one GQA group of six heads).
+// q8_0 or q5_1; V: q4_0, q5_1 or q8_0), for the few-token batches of decode and speculative
+// verify (one to five tokens, one GQA group of six heads).
 //
 // The tile and vec kernels are issue-bound here, not memory-bound: at 262144 context they read
 // the 151 MB q4_0 cache at ~125 GB/s, a fifth of what the card sustains, and they spend their
@@ -119,7 +119,7 @@ static __device__ __forceinline__ float fattn_q4p_lo_f(const uint32_t x) {
 // K words in registers. QK in fp32: an fp16 variant (bytes as exact q/16 halves) measured the same, since at depth
 // this kernel's time follows the K/V bytes it loads (q8_0 K: +44% bytes, +43% time at 262144 keys, at ~230 GB/s:
 // load latency per word, not DRAM bandwidth).
-template <int R, bool OLD = false, bool KQ8 = false, bool KQ5 = false>
+template <int R, bool OLD = false, bool KQ8 = false, bool KQ5 = false, bool VQ80 = false>
 struct fattn_q4p_cfg {
     static constexpr int NT     = 256;                    // threads per block
     static constexpr int RG     = Q4P_KNOB(RG, 1);        // row groups
@@ -173,8 +173,9 @@ struct fattn_q4p_cfg {
 #endif
     static constexpr bool QPK   = H16QK && Q4P_QPK == 1 && RQP % 8 == 0;
     static constexpr bool H16PV = Q4P_H16PV == 1 && (DPT == 4 || DPT == 8);
+    // VQ80 has one byte per dim, which does not fit the nibble-lane shuffles: plain path
     static constexpr bool RS    = !OLD && Q4P_RSON == 1 && Q4P_KNOB(RS, (R == 6 || R == 15 || R == 18) ? 1 : 2) == 1 &&
-                                  H16PV && DPT == 8 && RG == 1 && NPG == 8 && C/NPG <= Q4P_PVF;
+                                  H16PV && DPT == 8 && RG == 1 && NPG == 8 && C/NPG <= Q4P_PVF && !VQ80;
     // blocks per SM: 6 rows with RS fit 128 registers without spilling (kv 262144: 816 -> 741 us)
     static constexpr int  MINB  = R == Q4P_TUNE_R ? Q4P_MINB : ((RS && R == 6) ? 2 : 1);
     // P_s floats per position; with RS a warp reads 8 positions at once, so PSTR/4 is kept odd
@@ -231,8 +232,8 @@ static __device__ __forceinline__ int fattn_q4p_pv_dim(const int dg, const int j
     }
 }
 
-template <int ncols1, int ncols2, bool OLD, bool KQ8 = false, bool KQ5 = false, bool VQ51 = false>
-__launch_bounds__(256, (fattn_q4p_cfg<ncols1*ncols2, OLD, KQ8, KQ5>::MINB))
+template <int ncols1, int ncols2, bool OLD, bool KQ8 = false, bool KQ5 = false, bool VQ51 = false, bool VQ80 = false>
+__launch_bounds__(256, (fattn_q4p_cfg<ncols1*ncols2, OLD, KQ8, KQ5, VQ80>::MINB))
 static __global__ void flash_attn_ext_q4p(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -260,7 +261,7 @@ static __global__ void flash_attn_ext_q4p(
 #if defined(FLASH_ATTN_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     constexpr int D = FATTN_Q4P_D;
     constexpr int R = ncols1*ncols2;
-    using cfg = fattn_q4p_cfg<R, OLD, KQ8, KQ5>;
+    using cfg = fattn_q4p_cfg<R, OLD, KQ8, KQ5, VQ80>;
     constexpr int KBB = cfg::KBB;
     constexpr int NT = cfg::NT, RG = cfg::RG, RQ = cfg::RQ, RQP = cfg::RQP, C = cfg::C, PT = cfg::PT;
     constexpr int NSPLIT = cfg::NSPLIT, NQP = cfg::NQP, BPS = cfg::BPS, DPS = cfg::DPS, QREG = cfg::QREG;
@@ -415,6 +416,10 @@ static __global__ void flash_attn_ext_q4p(
     // with the selector in a register so lanes on even and odd blocks do not diverge
     const int      pv_oa  = pv_o & ~3;
     const uint32_t pv_sel = (pv_o & 2) ? 0x5432u : 0x3210u;
+    // q8_0 V: the thread's two words (dims 4*k..4*k+3 and 16+4*k..16+4*k+3) are 16 bytes apart;
+    // the qs bytes sit at 34*pv_b + 2, 4-aligned when pv_b is odd
+    const int      pv_o8   = (34*pv_b + 2 + 4*pv_k) & ~3;
+    const uint32_t pv_sel8 = (pv_b & 1) ? 0x3210u : 0x5432u;
 
     __syncthreads();
 
@@ -980,13 +985,18 @@ static __global__ void flash_attn_ext_q4p(
         // hide an L2 round trip behind the FMAs of the others
         const char * vrow0 = Vb + int64_t(k0 + min(pg, p_end - 1))*nb21;
         // q4_0 V: the scale plus the two aligned words straddling the 2-byte-aligned qs word;
-        // q5_1 V: {d, m}, qh and the thread's qs word, all 4-byte aligned
-        uint32_t nd = 0, nw0 = 0, nw1 = 0;
+        // q5_1 V: {d, m}, qh and the thread's qs word, all 4-byte aligned;
+        // q8_0 V: the scale plus the thread's two qs words, 16 bytes apart
+        uint32_t nd = 0, nw0 = 0, nw1 = 0, wA = 0, wB = 0;
         uint32_t qd = 0, qhw = 0, qw = 0;
         if constexpr (VQ51) {
             qd  = __ldg((const uint32_t *) (vrow0 + 24*pv_b));
             qhw = __ldg((const uint32_t *) (vrow0 + 24*pv_b + 4));
             qw  = __ldg((const uint32_t *) (vrow0 + 24*pv_b + 8 + 4*pv_k));
+        } else if constexpr (VQ80) {
+            nd = fattn_q4p_ld16(vrow0 + 34*pv_b);
+            wA = __byte_perm(__ldg((const uint32_t *) (vrow0 + pv_o8)),     __ldg((const uint32_t *) (vrow0 + pv_o8 + 4)),  pv_sel8);
+            wB = __byte_perm(__ldg((const uint32_t *) (vrow0 + pv_o8 + 16)), __ldg((const uint32_t *) (vrow0 + pv_o8 + 20)), pv_sel8);
         } else {
             nd  = fattn_q4p_ld16(vrow0 + 18*pv_b);
             nw0 = __ldg((const uint32_t *) (vrow0 + pv_oa));
@@ -1025,12 +1035,13 @@ static __global__ void flash_attn_ext_q4p(
             int np = 0;
             // V words two positions ahead: a quarter of the fp32 path's work per position no
             // longer covers an L2 round trip
-            uint32_t nd2 = 0, nw02 = 0, nw12 = 0;
+            uint32_t nd2 = 0, nw02 = 0, nw12 = 0, wA2 = 0, wB2 = 0;
             uint32_t qd2 = 0, qhw2 = 0, qw2 = 0;
             // row offsets within the chunk in 32 bits, advanced by one step and clamped to the last
             // row (the 64-bit row products cost ~20 instructions per position)
-            const char * vcd = Vb + int64_t(k0)*nb21 + (VQ51 ? 24*pv_b : 18*pv_b);
-            const char * vcw = Vb + int64_t(k0)*nb21 + (VQ51 ? 24*pv_b + 8 + 4*pv_k : pv_oa);
+            const char * vcd = Vb + int64_t(k0)*nb21 + (VQ51 ? 24*pv_b : (VQ80 ? 34*pv_b : 18*pv_b));
+            const char * vcw = Vb + int64_t(k0)*nb21 + (VQ51 ? 24*pv_b + 8 + 4*pv_k : (VQ80 ? pv_o8 : pv_oa));
+            const char * vcB = vcw + 16;
             const char * vcq = Vb + int64_t(k0)*nb21 + 24*pv_b + 4;
             const int vstep = NPG*nb21, vlast = (p_end - 1)*nb21;
             int vo = min(pg + NPG, p_end - 1)*nb21;
@@ -1039,6 +1050,10 @@ static __global__ void flash_attn_ext_q4p(
                     qd2  = __ldg((const uint32_t *) (vcd + vo));
                     qhw2 = __ldg((const uint32_t *) (vcq + vo));
                     qw2  = __ldg((const uint32_t *) (vcw + vo));
+                } else if constexpr (VQ80) {
+                    nd2 = fattn_q4p_ld16(vcd + vo);
+                    wA2 = __byte_perm(__ldg((const uint32_t *) (vcw + vo)),     __ldg((const uint32_t *) (vcw + vo + 4)),  pv_sel8);
+                    wB2 = __byte_perm(__ldg((const uint32_t *) (vcB + vo)),     __ldg((const uint32_t *) (vcB + vo + 4)),  pv_sel8);
                 } else {
                     nd2  = fattn_q4p_ld16(vcd + vo);
                     nw02 = __ldg((const uint32_t *) (vcw + vo));
@@ -1048,7 +1063,7 @@ static __global__ void flash_attn_ext_q4p(
 #pragma unroll 2
             for (int p = pg; p < p_end; p += NPG) {
                 half2 dv2, m2h;
-                uint32_t wv;
+                uint32_t wv, wvA = 0, wvB = 0;
                 uint32_t f_lo = 0, f_hi = 0;
                 float    dv = 0.0f, dm = 0.0f;
                 if constexpr (VQ51) {
@@ -1060,6 +1075,10 @@ static __global__ void flash_attn_ext_q4p(
                     f_lo = (qhw >> (4*pv_k)) & 0xF;
                     f_hi = (qhw >> (16 + 4*pv_k)) & 0xF;
                     qd = qd2; qhw = qhw2; qw = qw2;
+                } else if constexpr (VQ80) {
+                    dv2 = __half2half2(__ushort_as_half((unsigned short) nd));
+                    wvA = wA; wvB = wB;
+                    nd = nd2; wA = wA2; wB = wB2;
                 } else {
                     dv2 = __half2half2(__ushort_as_half((unsigned short) nd));
                     wv  = __byte_perm(nw0, nw1, pv_sel);
@@ -1071,6 +1090,10 @@ static __global__ void flash_attn_ext_q4p(
                         qd2  = __ldg((const uint32_t *) (vcd + vo));
                         qhw2 = __ldg((const uint32_t *) (vcq + vo));
                         qw2  = __ldg((const uint32_t *) (vcw + vo));
+                    } else if constexpr (VQ80) {
+                        nd2 = fattn_q4p_ld16(vcd + vo);
+                        wA2 = __byte_perm(__ldg((const uint32_t *) (vcw + vo)),     __ldg((const uint32_t *) (vcw + vo + 4)),  pv_sel8);
+                        wB2 = __byte_perm(__ldg((const uint32_t *) (vcB + vo)),     __ldg((const uint32_t *) (vcB + vo + 4)),  pv_sel8);
                     } else {
                         nd2  = fattn_q4p_ld16(vcd + vo);
                         nw02 = __ldg((const uint32_t *) (vcw + vo));
@@ -1106,6 +1129,19 @@ static __global__ void flash_attn_ext_q4p(
                                                         fmaf(dv, (float) ((xa >> 8) & 0x3Fu), dm));
                         y[2*h2 + 1] = __floats2half2_rn(fmaf(dv, (float) (xb & 0x3Fu), dm),
                                                         fmaf(dv, (float) ((xb >> 8) & 0x3Fu), dm));
+                    }
+                } else if constexpr (VQ80) {
+                    // flip the sign bit so the byte is unsigned, making the exact half 1024 + b + 128;
+                    // minus 1024 + 128, times the block scale. DPT 8: word A dims 4*k..4*k+3, word B
+                    // 16+4*k..16+4*k+3; DPT 4: one word per thread
+                    const half2 off8 = make_half2(1152.0f, 1152.0f);
+#pragma unroll
+                    for (int h2 = 0; h2 < NH/2; ++h2) {
+                        const uint32_t wv8 = ((DPT == 8 ? h2 : (dg & 1)) ? wvB : wvA) ^ 0x80808080u;
+                        const uint32_t ya = __byte_perm(wv8, 0x64646464u, 0x4140); // bytes 0, 1 as 1024 + b
+                        const uint32_t yb = __byte_perm(wv8, 0x64646464u, 0x4342); // bytes 2, 3
+                        y[2*h2 + 0] = __hmul2(__hsub2(*(const half2 *) &ya, off8), dv2);
+                        y[2*h2 + 1] = __hmul2(__hsub2(*(const half2 *) &yb, off8), dv2);
                     }
                 } else {
 #pragma unroll
@@ -1177,13 +1213,16 @@ static __global__ void flash_attn_ext_q4p(
 #pragma unroll 2
             for (int p = pg; p < p_end; p += NPG) {
             float dv = 0.0f, dm = 0.0f;
-            uint32_t wv = 0, f_lo = 0, f_hi = 0;
+            uint32_t wv = 0, wvA = 0, wvB = 0, f_lo = 0, f_hi = 0;
             if constexpr (VQ51) {
                 dv   = __half2float(__ushort_as_half((unsigned short) qd));
                 dm   = __half2float(__ushort_as_half((unsigned short) (qd >> 16)));
                 wv   = qw;
                 f_lo = (qhw >> (4*pv_k)) & 0xF;
                 f_hi = (qhw >> (16 + 4*pv_k)) & 0xF;
+            } else if constexpr (VQ80) {
+                dv = __half2float(__ushort_as_half((unsigned short) nd));
+                wvA = wA; wvB = wB;
             } else {
                 dv = __half2float(__ushort_as_half((unsigned short) nd));
                 wv = __byte_perm(nw0, nw1, pv_sel);
@@ -1194,6 +1233,10 @@ static __global__ void flash_attn_ext_q4p(
                     qd  = __ldg((const uint32_t *) (vrow + 24*pv_b));
                     qhw = __ldg((const uint32_t *) (vrow + 24*pv_b + 4));
                     qw  = __ldg((const uint32_t *) (vrow + 24*pv_b + 8 + 4*pv_k));
+                } else if constexpr (VQ80) {
+                    nd = fattn_q4p_ld16(vrow + 34*pv_b);
+                    wA = __byte_perm(__ldg((const uint32_t *) (vrow + pv_o8)),     __ldg((const uint32_t *) (vrow + pv_o8 + 4)),  pv_sel8);
+                    wB = __byte_perm(__ldg((const uint32_t *) (vrow + pv_o8 + 16)), __ldg((const uint32_t *) (vrow + pv_o8 + 20)), pv_sel8);
                 } else {
                     nd  = fattn_q4p_ld16(vrow + 18*pv_b);
                     nw0 = __ldg((const uint32_t *) (vrow + pv_oa));
@@ -1223,6 +1266,28 @@ static __global__ void flash_attn_ext_q4p(
                     const int e0 = 2*((dg >> 1) & 1);
                     y[0] = fmaf(dv, (float) ((nb >> (8*e0)) & 0xF | ((f >> e0) & 1) << 4), dm);
                     y[1] = fmaf(dv, (float) ((nb >> (8*e0 + 8)) & 0xF | ((f >> e0 + 1) & 1) << 4), dm);
+                }
+            } else if constexpr (VQ80) {
+                // exact signed byte in the mantissa, minus 2^23 + 128 (the scale folds below)
+                const uint32_t xa = wvA ^ 0x80808080u;
+                const uint32_t xb = wvB ^ 0x80808080u;
+                if constexpr (DPT == 8) {
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        y[e]     = __int_as_float(__byte_perm(xa, 0x4B000000u, 0x7440u | e)) - 8388736.0f;
+                        y[e + 4] = __int_as_float(__byte_perm(xb, 0x4B000000u, 0x7440u | e)) - 8388736.0f;
+                    }
+                } else if constexpr (DPT == 4) {
+                    const uint32_t xw = ((dg & 1) ? xb : xa);
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        y[e] = __int_as_float(__byte_perm(xw, 0x4B000000u, 0x7440u | e)) - 8388736.0f;
+                    }
+                } else {
+                    const uint32_t xw = ((dg & 1) ? xb : xa);
+                    const int e0 = 2*((dg >> 1) & 1);
+                    y[0] = __int_as_float(__byte_perm(xw, 0x4B000000u, 0x7440u | e0)) - 8388736.0f;
+                    y[1] = __int_as_float(__byte_perm(xw, 0x4B000000u, 0x7440u | (e0 + 1))) - 8388736.0f;
                 }
             } else if constexpr (DPT == 8) {
                 const uint32_t lo = wv & 0x0F0F0F0Fu, hi = (wv >> 4) & 0x0F0F0F0Fu;
@@ -1388,11 +1453,14 @@ static bool ggml_cuda_fattn_q4p_supported(const ggml_tensor * dst) {
     static const bool q8k = [] { const char * s = getenv("GGML_CUDA_FA_Q4P_Q8K"); return !s || atoi(s) != 0; }();
     // GGML_CUDA_FA_Q4P_Q51=0: q5_1 K/V back to the generic kernels
     static const bool q51 = [] { const char * s = getenv("GGML_CUDA_FA_Q4P_Q51"); return !s || atoi(s) != 0; }();
+    // GGML_CUDA_FA_Q4P_Q8V=0: a q8_0 V back to the generic kernels
+    static const bool q8v = [] { const char * s = getenv("GGML_CUDA_FA_Q4P_Q8V"); return !s || atoi(s) != 0; }();
     const bool kq51 = q51 && K->type == GGML_TYPE_Q5_1;
     const bool vq51 = q51 && V->type == GGML_TYPE_Q5_1;
+    const bool vq8  = q8v && V->type == GGML_TYPE_Q8_0;
     const bool k_ok = K->type == GGML_TYPE_Q4_0 || (q8k && K->type == GGML_TYPE_Q8_0) || kq51;
     // a q8_0 K with a q5_1 V has no kernel instantiation, so it stays on the generic kernels
-    const bool v_ok = V->type == GGML_TYPE_Q4_0 || (vq51 && K->type != GGML_TYPE_Q8_0);
+    const bool v_ok = V->type == GGML_TYPE_Q4_0 || (vq51 && K->type != GGML_TYPE_Q8_0) || vq8;
     if (!k_ok || !v_ok || Q->type != GGML_TYPE_F32 || sinks) {
         return false;
     }
@@ -1427,6 +1495,21 @@ template <int ncols1, int ncols2 = 6>
 static void ggml_cuda_flash_attn_ext_q4p_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const bool k5 = dst->src[1]->type == GGML_TYPE_Q5_1;
     const bool v5 = dst->src[2]->type == GGML_TYPE_Q5_1;
+    const bool v8 = dst->src[2]->type == GGML_TYPE_Q8_0;
+    if (v8) {
+        // q8_0 V: VQ80 only changes the PV side; the K flags keep their own geometry
+        if (k5) {
+            launch_fattn<FATTN_Q4P_D, ncols1, ncols2>(ctx, dst, flash_attn_ext_q4p<ncols1, ncols2, false, false, true, false, true>, 256/WARP_SIZE, 0,
+                fattn_q4p_cfg<ncols1*ncols2, false, false, true, true>::C, false, false, false, false);
+        } else if (dst->src[1]->type == GGML_TYPE_Q8_0) {
+            launch_fattn<FATTN_Q4P_D, ncols1, ncols2>(ctx, dst, flash_attn_ext_q4p<ncols1, ncols2, false, true, false, false, true>, 256/WARP_SIZE, 0,
+                fattn_q4p_cfg<ncols1*ncols2, false, true, false, true>::C, false, false, false, false);
+        } else {
+            launch_fattn<FATTN_Q4P_D, ncols1, ncols2>(ctx, dst, flash_attn_ext_q4p<ncols1, ncols2, false, false, false, false, true>, 256/WARP_SIZE, 0,
+                fattn_q4p_cfg<ncols1*ncols2, false, false, false, true>::C, false, false, false, false);
+        }
+        return;
+    }
     if (k5 && v5) {
         launch_fattn<FATTN_Q4P_D, ncols1, ncols2>(ctx, dst, flash_attn_ext_q4p<ncols1, ncols2, false, false, true, true>, 256/WARP_SIZE, 0,
             fattn_q4p_cfg<ncols1*ncols2, false, false, true>::C, false, false, false, false);
