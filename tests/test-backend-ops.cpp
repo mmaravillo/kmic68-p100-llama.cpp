@@ -9565,9 +9565,10 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     }
 };
 
-// K/V filled with a fixed quant pattern (q4_0: d=1; q5_1: d=1, m=-1.5, qh=0xE7C39A55; both with
-// qs[j] = j | j<<4), so the low 4 bits and the 5th bit of every dim are known. Random data can hide
-// a q5_1 bit-field that is read from the wrong qh position; this fill cannot.
+// K/V filled with a fixed quant pattern (q4_0: d=1; q5_1: d=1, m=-1.5, qh=0xE7C39A55; q4_0/q5_1 with
+// qs[j] = j | j<<4, q8_0 with qs[j] = j), so the value of every dim is known. Random data can hide a
+// q5_1 bit-field read from the wrong qh position or a q8_0 byte read from the wrong position in its
+// word; this fill cannot (block indexing is covered by the random rows).
 struct test_flash_attn_ext_qpat : public test_flash_attn_ext {
     using test_flash_attn_ext::test_flash_attn_ext;
 
@@ -9579,7 +9580,7 @@ struct test_flash_attn_ext_qpat : public test_flash_attn_ext {
         test_flash_attn_ext::initialize_tensors(ctx);
         for (const char * name : {"k", "v"}) {
             ggml_tensor * t = ggml_get_tensor(ctx, name);
-            GGML_ASSERT(t->type == GGML_TYPE_Q5_1 || t->type == GGML_TYPE_Q4_0);
+            GGML_ASSERT(t->type == GGML_TYPE_Q5_1 || t->type == GGML_TYPE_Q4_0 || t->type == GGML_TYPE_Q8_0);
             const size_t bs   = ggml_type_size(t->type);
             const size_t nblk = ggml_nelements(t) / 32;
             std::vector<uint8_t> buf(bs * nblk);
@@ -9591,6 +9592,10 @@ struct test_flash_attn_ext_qpat : public test_flash_attn_ext {
                     *(uint16_t *)(b + 2) = ggml_fp32_to_fp16(-1.5f);
                     b[4] = 0x55; b[5] = 0x9A; b[6] = 0xC3; b[7] = 0xE7;
                     for (int j = 0; j < 16; ++j) b[8 + j] = (uint8_t)(j | (j << 4));
+                } else if (t->type == GGML_TYPE_Q8_0) {
+                    // d = 1, qs = j: dim j is j - 128, so every dim, word and half-word differs
+                    *(uint16_t *)(b + 0) = ggml_fp32_to_fp16(1.0f);
+                    for (int j = 0; j < 32; ++j) b[2 + j] = (uint8_t) j;
                 } else {
                     *(uint16_t *)(b + 0) = ggml_fp32_to_fp16(1.0f);
                     for (int j = 0; j < 16; ++j) b[2 + j] = (uint8_t)(j | (j << 4));
@@ -13621,10 +13626,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 256, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q5_1, GGML_TYPE_Q4_0));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 256, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q5_1));
     }
+    // q8_0 V on the q4p kernel (VQ80), K on each of its own paths; 1280 leaves the last
+    // KV chunk partly filled, as the q4_0/q8_0 K blocks above do
+    for (int64_t nb : {1, 2, 4, 5}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 256, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 256, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 256, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    }
+    for (int64_t nb : {2, 5}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 1280, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 1280, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    }
     // constant-fill variants: the dequantized value of every dim is known by construction
     for (int64_t nb : {1, 4}) {
         test_cases.emplace_back(new test_flash_attn_ext_qpat(256, 256, 2, {6, 1}, 256, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q5_1, GGML_TYPE_Q5_1));
         test_cases.emplace_back(new test_flash_attn_ext_qpat(256, 256, 2, {6, 1}, 256, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+        test_cases.emplace_back(new test_flash_attn_ext_qpat(256, 256, 2, {6, 1}, 256, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext_qpat(256, 256, 2, {6, 1}, 256, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext_qpat(256, 256, 2, {6, 1}, 256, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     }
     // per-head mask must decline the direct q5_1 path and keep the f16 staging
     for (int64_t nb : {3, 32}) {
@@ -14728,8 +14747,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     // The q4p kernel's production widths (nb 2-5) with a q5_1 K/V cache, to verify the q4p-q5_1
     // dispatch end to end (nb=1 above reaches it too; these add the R and DPT shapes it uses).
-    for (int nb : {2, 3, 5}) {
+    for (int nb : {2, 3, 4, 5}) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 262144, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q5_1, GGML_TYPE_Q5_1));
+    }
+    // The same widths with a q8_0 cache. q8_0 V has no q4p path, so these are the generic-kernel cost
+    // that a direct q8_0 loader would have to beat: nb=1 above only bounds the narrowest width.
+    for (int nb : {2, 3, 4, 5}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 262144, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     }
     // Sparse flash attention (n_kv_max hint) decode across KV depths.
     // Shapes: 576/512 DeepSeek MLA, 512/512 DeepSeek-V4/GLM-5.2, 256/256 gqa12 Qwen QSA.
