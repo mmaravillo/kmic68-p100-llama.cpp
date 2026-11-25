@@ -1257,6 +1257,9 @@ struct ggml_backend_sched {
     int graph_size;
     int prev_graph_size;
 
+    size_t graph_bytes; // sum of node/leaf nbytes, to tell size-stable graphs from byte-varying ones
+    size_t prev_graph_bytes;
+
     int debug_realloc;
 
     // inputs of the next split read from the backend of the current split before it computes, see ggml_backend_sched_prefetch_inputs
@@ -1958,6 +1961,16 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     int graph_size = std::max(graph->n_nodes, graph->n_leafs) + total_inputs * 2 * sched->n_copies + n_dep_nodes + n_scratch_nodes;
 
     // remember the actual graph_size for performing reallocation checks later
+    size_t graph_bytes = 0;
+    for (int i = 0; i < graph->n_nodes; i++) {
+        graph_bytes += ggml_nbytes(graph->nodes[i]);
+    }
+    for (int i = 0; i < graph->n_leafs; i++) {
+        graph_bytes += ggml_nbytes(graph->leafs[i]);
+    }
+    sched->prev_graph_bytes = sched->graph_bytes;
+    sched->graph_bytes = graph_bytes;
+
     sched->prev_graph_size = sched->graph_size;
     sched->graph_size = graph_size;
 
@@ -2114,7 +2127,9 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 #endif
 
         // a reallocation with an unchanged graph size means that the previous reservation was not sufficient
-        const bool graph_size_changed = sched->prev_graph_size != sched->graph_size;
+        // inputs (e.g. the attention mask of a wider ubatch) can change bytes at an unchanged node count,
+        // so count both for the unexpected judgement
+        const bool graph_size_changed = (sched->prev_graph_size != sched->graph_size) || (sched->prev_graph_bytes != sched->graph_bytes);
 
         if (sched->callback_realloc != NULL) {
             sched->callback_realloc(sched, &sched->graph, backend_ids_changed, graph_size_changed, sched->callback_realloc_user_data);
@@ -2450,6 +2465,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->graph_size      = 0;
     sched->prev_graph_size = 0;
+    sched->graph_bytes = 0;
+    sched->prev_graph_bytes = 0;
 
     sched->context_buffer_size = ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(graph_size, false);
     sched->context_buffer = (char *) malloc(sched->context_buffer_size);
