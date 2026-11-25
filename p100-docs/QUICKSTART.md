@@ -74,9 +74,20 @@ creative writing. Cards that have been under sustained load read ~5-10% lower.
 | `--spec-draft-n-max 4 --spec-draft-p-min 0.2` | draft up to 4 tokens; stop below 20% confidence. Use 3 if you mostly work past ~150k context |
 | `-ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0` | the draft layer on the GPU, with its own small ubatch and a q4_0 cache. Without `-ubd 64` the draft runs out of memory at full context |
 | `--temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0` | the model card's sampling. The gguf doesn't carry min-p, so without the flag llama.cpp's 0.05 applies |
-| `GGML_CUDA_P2P=1` | direct copies between the cards instead of through host memory[^iommu] |
+| `GGML_CUDA_P2P=1` | direct copies between the cards instead of through host memory[^iommu][^plx] |
 | `GGML_CUDA_GRAPHS_PRE_VOLTA=3` | CUDA graphs for the single-token MTP draft steps only. Full graphs (`1`) run out of VRAM at full context |
 | `LLAMA_SPEC_SAMPLE_TEMP=1.0 LLAMA_SPEC_DRAFT_TOPK=20` | the draft samples instead of taking its top token, and the verify uses the speculative-sampling rule. The output distribution is unchanged; more drafts get accepted |
+
+## Coding agents
+
+Agent clients such as OpenCode send many requests that share a long prefix (system prompt, tool
+definitions, earlier turns) and differ after it. By default the server checkpoints the recurrent
+state only near the end of each prompt, so a request that branches earlier rolls back and
+reprocesses the shared part. `LLAMA_CKPT_USER_SPLIT=1` also checkpoints at user-message
+boundaries. In a user's A/B with OpenCode it cut time to first token from ~1.55 s to ~0.57 s.
+It is off by default because plain chat pays for the extra checkpoint on every turn (~0.4 s on a
+short turn). With `-np 1`, the client's automatic title requests are separate prompts in the same
+slot and push the conversation out of the cache; turning them off helped too.
 
 ## VRAM
 
@@ -125,3 +136,8 @@ read up to 20% low. To check accuracy, run `tools/gate.sh`; perplexity should la
     In the default translated mode, `nvidia-smi topo -p2p r` can report OK while peer writes are
     dropped (`AMD-Vi: IO_PAGE_FAULT` in `dmesg`). Booting with `iommu=pt` fixed it on an X370 board
     ([PR #20](https://github.com/Kmic-68/llama.cpp/pull/20), measured on the 8 Oct tag).
+[^plx]: Behind a PLX PCIe switch, `iommu=pt` is not enough. On 4x P100 behind a PEX8748,
+    `GGML_CUDA_P2P=1` hung `-sm tensor` decode (cards at 100% and ~40 W) and gave garbage text under
+    `-sm layer`, also with Llama-3.2-1B. With `GGML_CUDA_P2P` unset the same command was correct:
+    ~30 t/s without MTP, 46-49 t/s with it
+    ([PR #21](https://github.com/Kmic-68/llama.cpp/pull/21), measured on `bbad6fcfb`).
