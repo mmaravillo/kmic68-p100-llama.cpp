@@ -4169,7 +4169,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.speculative.draft.n_ubatch = value;
         }
-    ).set_env("LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE").set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    ).set_spec().set_env("LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE").set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--spec-draft-type-k", "-ctkd", "--cache-type-k-draft"}, "TYPE",
         string_format(
