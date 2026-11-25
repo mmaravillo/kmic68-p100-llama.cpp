@@ -8,6 +8,45 @@ Measurements are on 2x Tesla P100-PCIE-16GB (`sm_60`, 180 W cap, driver 575.57.0
 what it measured, in time order. Work before 2026-11-19 lives there and in
 [`../OPTLOG.md`](../OPTLOG.md).
 
+## 2026-11-25 - the q4p kernel running on a q8_0 V cache
+
+- `083bf471b` teaches `flash_attn_ext_q4p` a q8_0 V through the `VQ80` template flag, gates the V side
+  independently of K (q8_0 V pairs with q4_0, q5_1 and q8_0 K), and adds q8_0 V eval cases against each
+  K path plus a constant fill (`d = 1, qs[j] = j`, so dim j is `j - 128` and every dim, word and
+  half-word differs). Runtime switch `GGML_CUDA_FA_Q4P_Q8V`, default on. Merged as PR 5 (`cbd2e77d8`).
+
+Before this, a full q8_0 cache had no in-register path: K learned q8_0 earlier, V refused it and the
+whole call fell back - `nb <= 2` to vec, above that to the tile kernel PR 3 made direct.
+
+Kernel A/B at `kv=262144`, `nh=8`, `us/run`, min of two reps (VQ80 on against the direct tile kernel):
+nb=1 1160 against 2505, nb=2 1397 against 3193, nb=3 2374 against 3317, nb=4 2446 against 3310,
+nb=5 2829 against 4968 - 2.16x, 2.29x, 1.40x, 1.35x, 1.76x. The flag switch itself is proven by timing:
+the same shape runs 1157 us with `GGML_CUDA_FA_Q4P_Q8V=1` and 2519 us with `=0`.
+
+End to end with q8_0 KV, draft cache q4_0, ctx 114688, MTP on, per-pass latency (acceptance-free
+`ms/pass`, acceptance matched .652/.652 at 96k): 16k +3.5%, 32k +5.4%, 64k +11.1%, 96k +17.3%
+(87.25 -> 72.20 ms/pass); flat at 2k. The same arms with q5_1 KV measure +17.2% at 96k, so the two
+V-flags behave identically end to end.
+
+Correctness: full `FLASH_ATTN_EXT` eval 4625 OK / 0 FAIL / 0 sentinel, dispatch proof green at both
+switch positions; q8_0 V family max NMSE 1.229e-05 against the fp32 reference (tolerance 5e-4).
+Determinism: 256/256 replay identical at KL 0.000. Deep MTP replay at measured depth 96699: 32/32
+sampled tokens identical to the tile path, mean KL 3.4e-5, max 6.9e-4. Shallow greedy probe: 225/256
+identical, 31 flips all near-tied (median non-flipped logprob delta 0.0025 nats).
+
+A q8_0 V block is 34 B, a 2-byte scale plus 32 bytes, so the loader gets its own split-prefetch word
+offset (`pv_o8`): the thread's two words, dims `4k..4k+3` and `16+4k..4k+3`, are read 16 B apart. K
+geometry is unchanged. VQ80 runs the plain PV path only - the RS shuffles assume nibble and 5th-bit
+layouts, which a byte-per-dim block does not have. Two bugs found while validating, both fixed: the
+H16PV q8_0 dequant was missing the sign-bit flip (`^ 0x80808080u`), and the prefetch advanced the
+block pointer before capturing `wA/wB` into `wvA/wvB`, skewing every block after the first - the
+constant fill localizes both.
+
+Open: register spill at `R=18 nb=3` (120 B with q5_1 K, 132 B with q8_0 K) and `R=30 nb=5` (20 B with
+q4_0 K) per ptxas. Spill is bit-exact storage and the spilling widths still measure 1.40x and 1.76x
+ahead of the tile kernel; the shrink alternative (`R=15`) was already spilling before this change and
+is slower. Kept as a tripwire for future register additions.
+
 ## 2026-11-24 - the q4p kernel running on a q5_1 cache
 
 - `f9364850d` teaches `flash_attn_ext_q4p` a q5_1 K and V through the `KQ5` / `VQ51` template flags,
