@@ -645,7 +645,10 @@ static void ggml_cuda_op_gated_delta_net_impl(
             GDN_LAUNCH(true, false, false);
         }
     } else {
-        if (S_v == 128 && src_pend == nullptr) {
+        // the chunked form assumes plain packed rows and knows nothing about pending replay
+        // (ggml_gated_delta_net_ext); padded/permuted views go to the sequential kernel
+        if (S_v == 128 && src_pend == nullptr && ggml_is_contiguous(src_q) && ggml_is_contiguous(src_k) &&
+            ggml_is_contiguous(src_v) && ggml_is_contiguous(src_state)) {
             // the chunked form knows nothing about pending replay (ggml_gated_delta_net_ext)
             const ggml_cuda_gdn_alt_args a = { q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 H, n_tokens, n_seqs, neqk1, rq3, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
