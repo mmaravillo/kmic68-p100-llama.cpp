@@ -365,6 +365,9 @@ struct llm_attn_mask {
     ggml_tensor * rows = nullptr; // I32 [n_kv_rows, n_slices]
     uint32_t      n_kv = 0;
 
+    // the raw mask must stay f16 (consumers that do not understand the compact form)
+    bool force_f16 = false;
+
     // fill every token of a sequence with the mask row of its first token (dspark draft blocks)
     bool block_uniform = false;
 };
@@ -1432,7 +1435,7 @@ struct llm_graph_context {
             ggml_tensor * top_k,   // [n_top, n_tokens]
                     int   il) const;
 
-    llm_graph_input_attn_kv_iswa * build_attn_inp_kv_iswa() const;
+    llm_graph_input_attn_kv_iswa * build_attn_inp_kv_iswa(bool force_f16 = false) const;
 
     llm_graph_input_dsv4 * build_inp_dsv4() const;
 

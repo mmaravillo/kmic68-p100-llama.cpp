@@ -202,7 +202,7 @@ llama_model_gemma4::graph::graph(const llm_graph_params & params) :
     ggml_tensor * inp_pos = build_inp_pos();
 
     // TODO: is causal == true correct? might need some changes
-    auto * inp_attn = build_attn_inp_kv_iswa();
+    auto * inp_attn = build_attn_inp_kv_iswa(true);
 
     auto inp_attn_prune = *inp_attn;
 
