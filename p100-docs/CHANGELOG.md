@@ -8,6 +8,43 @@ Measurements are on 2x Tesla P100-PCIE-16GB (`sm_60`, 180 W cap, driver 575.57.0
 what it measured, in time order. Work before 2026-11-19 lives there and in
 [`../OPTLOG.md`](../OPTLOG.md).
 
+## 2026-11-25 - upstream sync to `beb9d4933`
+
+`229df098e` merges upstream `ggml-org/llama.cpp` master at `beb9d4933` (version 1.1.0), 209 commits
+since the previous merge point `41d8297fe`. Against `p100-optimizations` (`0a4e3dd04`, also the merge
+base) the head is 6 commits, 1093 files, +76347 / -22452. It landed on `p100-optimizations` as PR 7
+(`dff1f4225`, merged 2026-11-25).
+
+The hard file was again `gated_delta_net.cu`: upstream rewrote it with pending-token replay
+(`ggml_gated_delta_net_ext`, `src[6]`) and a 4-cols-per-warp layout. Resolution keeps the upstream
+kernel and re-applies our Pascal features on top (state-gather fusion, fused l2 pre-op, chunked alt
+path). `ggml-backend.cpp` hand-combines the fork input-copy sync reduction with upstream's
+`fast_async_host_input` async host reads.
+
+Five fork fixes ride with the merge, each caught by a battery leg:
+
+- `1c0ced0a9` our chunked GDN form (`GGML_CUDA_GDN_CHUNKED`, default on) assumed packed contiguous
+  q/k/v/state. Upstream's padded shapes made it read at wrong strides and its pending input was
+  silently dropped (ERR ~1e-3). Now runs only on contiguous, pending-free inputs.
+- `f1d64244c` `--spec-draft-ubatch-size` lacked `set_spec()`; upstream's arg-parser test
+  excepts spec args from alias ordering.
+- `7468e47b9` the compact I32 causal mask reached the lightning indexer, which reads mask values and
+  asserts f16; deepseek4 lightning/DSA aborted at graph build. Compact branch is now opt-out.
+- `4123d1877` same class: gemma4 prune copies dense mask rows, minimax-m3 MSA reads and casts the
+  mask. `llm_attn_mask.force_f16` requests the dense form; mask reuse honours it.
+- `0a09c55e8` fork graphs keep node and leaf counts across ubatches while a wider ubatch grows the
+  mask in bytes, so the `GGML_SCHED_DEBUG_REALLOC=1` heuristic (set by ctest) judged that realloc
+  unexpected and aborted on clover_moe `noalloc`. The judgement counts bytes next to counts; a truly
+  unreserved realloc still aborts. This one is inherited from the Kmic base, which aborts identically;
+  stock never fires it because its node counts vary.
+
+Battery on the merge tree, 2x P100: `test-llama-context` 150/150 serial (150 dummy archs),
+`test-backend-ops -b CUDA0` 21,811 OK / 0 FAIL, `FLASH_ATTN_EXT` family 4,625 / 0, `GATED_DELTA_NET`
+incl. replay 111 / 0, ctest full suite 75/75 rc=0 (torch and git-lfs legs now runnable on this box),
+VQ80 dispatch proof 465 OK / 0 FAIL / 0 sentinel at both `GGML_CUDA_FA_Q4P_Q8V` positions, bench
+advisory UD-Q6_K_XL q8_0 KV pp512 245.65 +/- 0.41, pp2048 367.23 +/- 0.90. Known non-gate: grad mode
+aborts upstream on split-REGLU (`ggml.c:7303`), a stock registration bug unrelated to this fork.
+
 ## 2026-11-25 - the q4p kernel running on a q8_0 V cache
 
 - `083bf471b` teaches `flash_attn_ext_q4p` a q8_0 V through the `VQ80` template flag, gates the V side

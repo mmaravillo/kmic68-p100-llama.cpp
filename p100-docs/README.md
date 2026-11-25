@@ -5,8 +5,8 @@ which upstream mostly leaves on generic paths. It is tuned for two
 Tesla P100-PCIE-16GB cards, tensor-split, running Qwen3.8-27B Q6_K with a q4_0 KV cache. Other quant
 types (Q5_K_M, Q4_K_M, IQ*, ...) get Pascal paths too.
 
-It tracks upstream by merging. The last merge was upstream `41d8297fe`
-(2026-11-19), so current model architectures are supported.
+It tracks upstream by merging. The last merge was upstream `beb9d4933`
+(2026-11-25, version 1.1.0), so current model architectures are supported.
 
 ## Results
 
