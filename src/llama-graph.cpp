@@ -41,7 +41,8 @@ static ggml_tensor * build_attn_inp_kq_mask(
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
     // compact causal mask: I32 [n_tokens] of kept-prefix lengths (llama_kv_cache::kq_mask_prefix)
-    if (cparams.flash_attn && n_stream == 1 && mctx->kq_mask_compact(ubatch, cparams.causal_attn)) {
+    // flash attention understands it; a consumer that forces f16 (lightning indexer) must not get it
+    if (cparams.flash_attn && !force_f16 && n_stream == 1 && mctx->kq_mask_compact(ubatch, cparams.causal_attn)) {
         ggml_tensor * res = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_tokens, 1, 1, 1);
         ggml_set_input(res);
         ggml_set_name(res, "attn_inp_kq_mask");
@@ -65,12 +66,13 @@ static bool can_reuse_kq_mask(
         ggml_tensor * kq_mask,
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
-        const llama_cparams & cparams) {
+        const llama_cparams & cparams,
+        bool force_f16 = false) {
     const auto n_kv     = mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
-    const bool compact = cparams.flash_attn && n_stream == 1 && mctx->kq_mask_compact(ubatch, cparams.causal_attn);
+    const bool compact = cparams.flash_attn && !force_f16 && n_stream == 1 && mctx->kq_mask_compact(ubatch, cparams.causal_attn);
     if (compact || kq_mask->type == GGML_TYPE_I32) {
         return compact && kq_mask->type == GGML_TYPE_I32 && kq_mask->ne[0] == n_tokens &&
                kq_mask->op_params[0] == (int32_t) n_kv;
@@ -90,7 +92,8 @@ static bool can_reuse_attn_mask(
         const llm_attn_mask & attn_mask,
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
-        const llama_cparams & cparams) {
+        const llama_cparams & cparams,
+        bool force_f16 = false) {
     const uint32_t n_kv_rows = cparams.fused_kv_rows ? mctx->get_n_kv_rows() : 0;
     const uint32_t n_slices  = llama_kv_cache::get_n_kv_slices(ubatch);
     const auto     n_tokens  = ubatch.n_tokens;
@@ -104,7 +107,7 @@ static bool can_reuse_attn_mask(
     }
 
     if (!use_rows) {
-        return can_reuse_kq_mask(attn_mask.raw, mctx, ubatch, cparams);
+        return can_reuse_kq_mask(attn_mask.raw, mctx, ubatch, cparams, force_f16);
     }
 
     bool res = true;
@@ -839,7 +842,7 @@ bool llm_graph_input_attn_k_dsa::can_reuse_impl(const llm_graph_params & params)
     res &= self_k_idxs_lid->ne[0] == params.ubatch.n_tokens;
 
     res &= can_reuse_attn_mask(self_attn_mask_mla, mctx->get_mla(), params.ubatch, params.cparams);
-    res &= can_reuse_attn_mask(self_attn_mask_lid, mctx->get_lid(), params.ubatch, params.cparams);
+    res &= can_reuse_attn_mask(self_attn_mask_lid, mctx->get_lid(), params.ubatch, params.cparams, true);
 
     return res;
 }
